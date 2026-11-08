@@ -28,7 +28,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 WORK_DIR = "/run/smartclone"
 LIVE_MEDIUM = "/run/live/medium"
 CHUNK = 4 * 1024 * 1024
@@ -41,6 +41,8 @@ SYSTEM_PARTTYPES = {"c12a7328-f81f-11d2-ba4b-00a0c93ec93b", "0xef",
                     "bc13c2ff-59e6-4262-a352-b275fd6f7172",
                     "e3c9e316-0b5c-4db8-817d-f92df00215ae"}
 RECOVERY_PARTTYPES = {"de94bba4-06d1-4d40-a16a-bfd50179d6ac", "0x27"}
+ESP_PARTTYPES = {"c12a7328-f81f-11d2-ba4b-00a0c93ec93b", "0xef"}
+MSR_PARTTYPE = "e3c9e316-0b5c-4db8-817d-f92df00215ae"
 # Folder name under EFI/ on the EFI system partition -> OS it boots.
 EFI_VENDORS = {
     "microsoft": "Microsoft Windows", "fedora": "Fedora Linux", "ubuntu": "Ubuntu",
@@ -314,6 +316,12 @@ class Partition:
     os_name: str = None
     inner_path: str = None    # unlocked LUKS: /dev/mapper device holding the filesystem
     inner_fstype: str = None
+    boot_for: list = field(default_factory=list)    # OSes named by boot files on it
+    fstab_refs: set = field(default_factory=set)    # UUID=/LABEL=... its /etc/fstab mounts
+
+    @property
+    def ptype(self):
+        return (self.parttype or "").lower()
 
     @property
     def mounted(self):
@@ -332,7 +340,9 @@ class Disk:
     partitions: list = field(default_factory=list)
     boot_names: list = field(default_factory=list)  # OSes named in its boot files
 
-    def describe(self):
+    def describe(self, short=False):
+        if short:
+            return f"{self.name} {human(self.size)}"
         bits = [self.name, human(self.size)]
         if self.tran:
             bits.append(self.tran.upper())
@@ -544,9 +554,7 @@ def probe(disks, mounts):
                 continue
             if part.mounted:
                 root = part.mounted[0]
-                part.os_name = detect_os(root)
-                part.used = usage(root)
-                disk.boot_names += boot_names(root)
+                read_partition(part, root)
                 if part.os_name and "/" in part.mounted:
                     part.os_name += "  (running now)"
                 continue
@@ -555,13 +563,45 @@ def probe(disks, mounts):
                 note(f"{part.name}: could not mount {part.fstype} read-only")
                 continue
             try:
-                part.os_name = detect_os(target)
-                part.used = usage(target)
-                disk.boot_names += boot_names(target)
+                read_partition(part, target)
             finally:
                 mounts.umount(target)
             note(f"{part.name}: {part.fstype}, {part.os_name or 'no OS'}, used {human(part.used)}")
+        disk.boot_names = [n for p in disk.partitions for n in p.boot_for]
         assign_boot_names(disk)
+
+
+def read_partition(part, root):
+    part.os_name = detect_os(root)
+    part.used = usage(root)
+    part.boot_for = boot_names(root)
+    part.fstab_refs = fstab_refs(root) if part.os_name else set()
+
+
+def fstab_refs(root):
+    """Devices a Linux root mounts at boot: {"UUID=...", "LABEL=...", "/dev/sda3"}."""
+    for sub in LINUX_ROOT_SUBDIRS:
+        try:
+            with open(os.path.join(root, sub, "etc", "fstab"), errors="replace") as f:
+                return {l.split()[0] for l in f if l.strip() and not l.lstrip().startswith("#")}
+        except OSError:
+            continue
+    return set()
+
+
+def system_partitions(disk, os_part):
+    """Partitions one OS needs to boot on its own."""
+    windows = same_os(os_part.os_name, "Windows")
+    keep = []
+    for p in disk.partitions:
+        refs = {f"UUID={p.uuid}", f"PARTUUID={p.partuuid}", f"LABEL={p.label}", p.path}
+        if (p is os_part or p.ptype in ESP_PARTTYPES
+                or (windows and (p.ptype == MSR_PARTTYPE or p.ptype in RECOVERY_PARTTYPES))
+                or (not windows and (p.fstype == "swap"
+                                     or any(same_os(n, os_part.os_name) for n in p.boot_for)
+                                     or refs & os_part.fstab_refs))):
+            keep.append(p)
+    return keep
 
 
 def assign_boot_names(disk):
@@ -601,20 +641,37 @@ def scan(ui, mounts):
 
 
 def os_choices(disks):
-    """One entry per OS found, plus one per disk with no OS so any disk can be saved."""
+    """(label, disk, os name, partitions or None for the whole disk).
+
+    A disk with several systems gets one entry per system (only its
+    partitions) plus one for the whole disk; any disk can be saved whole.
+    """
     with_os, without_os = [], []
     for disk in disks:
         found = [p for p in disk.partitions if p.os_name]
-        for p in found:
-            with_os.append((f"{p.os_name}   ({disk.describe()})", disk, p.os_name))
-        if not found:
-            without_os.append((f"No OS found - whole disk   ({disk.describe()})", disk, None))
+        if len(found) > 1:
+            for p in found:
+                with_os.append((f"{p.os_name} - only this system   ({disk.describe(True)})",
+                                disk, p.os_name, system_partitions(disk, p)))
+            names = " + ".join(short_name(p.os_name) for p in found)
+            with_os.append((f"Whole disk: {names}   ({disk.describe(True)})",
+                            disk, names, None))
+        elif found:
+            with_os.append((f"{found[0].os_name}   ({disk.describe()})", disk, found[0].os_name, None))
+        else:
+            without_os.append((f"No OS found - whole disk   ({disk.describe()})", disk, None, None))
     return with_os + without_os
 
 
-def check_not_busy(disk):
+def short_name(os_name):
+    return re.sub(r"\s*\((encrypted|not readable|BitLocker|running now)\)", "", os_name).strip()
+
+
+def check_not_busy(disk, parts=None):
     fresh = next((d for d in list_disks() if d.path == disk.path), disk)
-    busy = [f"{p.path} on {', '.join(p.mounted)}" for p in fresh.partitions if p.mounted]
+    wanted = {p.path for p in (parts or disk.partitions)} or {p.path for p in fresh.partitions}
+    busy = [f"{p.path} on {', '.join(p.mounted)}" for p in fresh.partitions
+            if p.mounted and p.path in wanted]
     if busy:
         raise Abort(f"{disk.path} is in use:\n  " + "\n  ".join(busy) +
                     "\n\nUnmount it, or boot from the SmartClone USB to work on the running system.")
@@ -836,13 +893,16 @@ def partition_layout(disk_path):
     return layout, sector
 
 
-def save_image(ui, disk, os_name, img_dir, shown, log):
+def save_image(ui, disk, os_name, img_dir, shown, log, only=None):
+    """Save the whole disk, or with `only` just those partitions (one system)."""
     comp_cmd, ext = compressor()
     manifest = {
         "tool": f"smartclone {VERSION}",
         "created": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
         "host": socket.gethostname(),
         "os": os_name,
+        "scope": "system" if only else "disk",
+        "systems": [short_name(p.os_name) for p in (only or disk.partitions) if p.os_name],
         "disk": {"name": disk.name, "path": disk.path, "size": disk.size,
                  "model": disk.model, "pttype": disk.pttype},
         "compression": ext,
@@ -857,7 +917,9 @@ def save_image(ui, disk, os_name, img_dir, shown, log):
         run(["sgdisk", f"--backup={os.path.join(img_dir, 'pt.sgdisk')}", disk.path],
             check=False, stdout=log, stderr=log)
     layout, sector = partition_layout(disk.path)
-    if layout:
+    # A GPT system-only image is laid out afresh on restore; MBR keeps offsets
+    # and boot code, so it needs the boot area.
+    if layout and not (only and disk.pttype == "gpt"):
         boot_len = min(min(v["start"] for v in layout.values()) * sector, BOOT_AREA_MAX)
         with open(disk.path, "rb") as src, open(os.path.join(img_dir, "boot-area.img"), "wb") as dst:
             dst.write(src.read(boot_len))
@@ -865,7 +927,7 @@ def save_image(ui, disk, os_name, img_dir, shown, log):
     manifest["sector_size"] = sector
     manifest["partition_table"] = "pt.sfdisk" if has_table else None
 
-    parts = disk.partitions
+    parts = only or disk.partitions
     if not parts:  # no partition table: save the whole device raw
         parts = [Partition(name=disk.name, path=disk.path, size=disk.size)]
     plans = [(p, *plan_partition(p)) for p in parts]
@@ -947,7 +1009,10 @@ def restore_text(m):
         *(["dd if=boot-area.img of=$TARGET bs=1M conv=fsync",
            "sed -e '/^device:/d' -e '/^last-lba:/d' -e 's#^/dev/[^ ]*[^0-9]\\([0-9]\\+\\) :#${TARGET}${P}\\1 :#'"
            " pt.sfdisk | sfdisk $TARGET",
-           "partprobe $TARGET", ""] if m.get("partition_table") else []),
+           "partprobe $TARGET", ""] if m.get("partition_table") and m.get("scope") != "system"
+          else ["# Only some partitions of the original disk are in this image: create them",
+                "# first (sizes and types in pt.sfdisk, numbers in image.json), or simply",
+                "# restore with SmartClone, which lays them out by itself.", ""]),
         *[restore_cmd(p, d) for p in m["partitions"]],
         "sync",
         "",
@@ -982,9 +1047,9 @@ def restore_cmd(p, d):
     return f"mkswap{opts} {dev}"
 
 
-def unlock_encrypted(ui, mounts, disk):
+def unlock_encrypted(ui, mounts, parts):
     """Ask for each LUKS partition's passphrase so only the used space is saved."""
-    for part in disk.partitions:
+    for part in parts:
         if part.fstype != "crypto_LUKS":
             continue
         mapper = None
@@ -1021,16 +1086,16 @@ def do_save(ui, mounts):
         raise Abort("No disks found.")
     choices = os_choices(disks)
     idx = ui.menu("Which system do you want to save?\n"
-                  "The whole disk it is installed on is saved.",
-                  [(str(i), label) for i, (label, _, _) in enumerate(choices)])
+                  "'Only this system' saves just its partitions; the others save the whole disk.",
+                  [(str(i), c[0]) for i, c in enumerate(choices)])
     if idx is None:
         return
-    _, source, os_name = choices[int(idx)]
-    check_not_busy(source)
-    unlock_encrypted(ui, mounts, source)
+    _, source, os_name, only = choices[int(idx)]
+    parts = only or source.partitions
+    check_not_busy(source, parts)
+    unlock_encrypted(ui, mounts, parts)
     if os_name and "(encrypted)" in os_name:  # name may be more precise now
-        os_name = next((p.os_name for p in source.partitions
-                        if p.inner_path and p.os_name), os_name)
+        os_name = next((p.os_name for p in parts if p.inner_path and p.os_name), os_name)
 
     loc = choose_location(ui, disks, mounts, "save", exclude=source)
     if loc is None:
@@ -1039,8 +1104,11 @@ def do_save(ui, mounts):
     if disk_of_path(dest) == source.path:
         raise Abort(f"{dest} is on the disk being saved ({source.path}). Pick another place.")
 
-    base = re.sub(r"\s*\((encrypted|not readable|BitLocker)\)", "", os_name or source.name)
-    default = f"{slug(base)[:40]}-{datetime.datetime.now():%Y-%m-%d-%H%M}"
+    base = short_name(os_name or source.name)
+    base = slug(base)
+    if len(base) > 40:
+        base = base[:40].rsplit("-", 1)[0]
+    default = f"{base}-{datetime.datetime.now():%Y-%m-%d-%H%M}"
     while True:
         name = ui.ask("Name of the image (a folder with this name is created)", default)
         if not name:
@@ -1051,20 +1119,22 @@ def do_save(ui, mounts):
             break
         ui.msg(f"{shown} already exists, pick another name.")
 
-    estimate = sum(plan_partition(p)[2] for p in source.partitions) or source.size
+    estimate = sum(plan_partition(p)[2] for p in parts) or source.size
     free = shutil.disk_usage(dest).free
-    others = [p.os_name for p in source.partitions if p.os_name and p.os_name != os_name]
-    summary = (f"Save:        {os_name or '(no OS found)'}\n"
-               + (f"Also on it:  {', '.join(others)}\n" if others else "") +
+    left_out = [f"{p.name} ({short_name(p.os_name) if p.os_name else p.label or p.fstype or 'empty'})"
+                for p in source.partitions if p not in parts]
+    summary = (f"Save:        {os_name or '(no OS found)'}"
+               + ("  - only this system" if only else "") + "\n" +
                f"Disk:        {source.describe()}\n"
-               f"Partitions:  {', '.join(p.name for p in source.partitions) or 'none'}\n"
+               f"Partitions:  {', '.join(p.name for p in parts) or 'none'}\n"
+               + (f"Left out:    {', '.join(left_out)}\n" if only else "") +
                f"Save to:     {shown}\n"
                f"Data:        ~{human(estimate)} (compressed while saving)\n"
                f"Free space:  {human(free)}\n")
     if free < estimate:
         summary += "\nWARNING: free space is less than the data to save.\n" \
                    "Compression usually makes up for it, but saving may fail.\n"
-    raw = sorted({p.fstype for p in source.partitions
+    raw = sorted({p.fstype for p in parts
                   if p.fstype and p.fstype != "swap" and plan_partition(p)[0] == "raw"})
     if raw:
         summary += f"\nNote: {', '.join(raw)} partitions are copied in full (slower).\n"
@@ -1076,7 +1146,7 @@ def do_save(ui, mounts):
     open(marker, "w").close()
     start = time.monotonic()
     with open(os.path.join(img_dir, "smartclone.log"), "w") as log:
-        manifest = save_image(ui, source, os_name, img_dir, shown, log)
+        manifest = save_image(ui, source, os_name, img_dir, shown, log, only)
     os.remove(marker)
     ui.info("Flushing data to the destination...")
     run(["sync"], check=False)
@@ -1104,25 +1174,51 @@ def find_images(root):
     return images
 
 
+def packed(m):
+    """System-only GPT image: its partitions go one after another from the
+    start of the disk (keeping their sizes, types and IDs)."""
+    return m.get("scope") == "system" and m["disk"].get("pttype") == "gpt"
+
+
 def needed_bytes(m):
-    ends = [(p["start"] + p["sectors"]) for p in m["partitions"] if "start" in p]
-    if not ends:
+    sector = m.get("sector_size", 512)
+    parts = [p for p in m["partitions"] if "start" in p]
+    if not parts:
         return m["disk"]["size"]
+    if packed(m):
+        grain = 1024 * 1024 // sector
+        used = sum(-(-p["sectors"] // grain) * grain for p in parts)
+        return (grain + used + 34) * sector
     # + room for the backup GPT at the end of the disk
-    return (max(ends) + 34) * m.get("sector_size", 512)
+    return (max(p["start"] + p["sectors"] for p in parts) + 34) * sector
 
 
-def sfdisk_script(text, target):
-    """Original dump retargeted: new device names, no fixed disk end."""
-    lines = []
+def sfdisk_script(text, target, m=None):
+    """Original dump retargeted: new device names, no fixed disk end.
+
+    For a system-only image keep just its partitions (packed for GPT).
+    Returns (script, {old partition number: new number}).
+    """
+    keep = None
+    if m and m.get("scope") == "system":
+        keep = [p["number"] for p in m["partitions"] if p.get("number")]
+    lines, numbers = [], {}
     for line in text.splitlines():
         if line.startswith(("device:", "last-lba:")):
             continue
-        m = re.match(r"^\s*(\S*?)(\d+)\s*:(.*)$", line)
-        if m and "start=" in line:
-            line = f"{part_dev(target, int(m.group(2)))} :{m.group(3)}"
+        found = re.match(r"^\s*(\S*?)(\d+)\s*:(.*)$", line)
+        if found and "start=" in line:
+            old, rest = int(found.group(2)), found.group(3)
+            if keep is not None and old not in keep:
+                continue
+            new = old
+            if keep is not None and packed(m):
+                new = len(numbers) + 1
+                rest = re.sub(r"start=\s*\d+,\s*", "", rest)
+            numbers[old] = new
+            line = f"{part_dev(target, new)} :{rest}"
         lines.append(line)
-    return "\n".join(lines) + "\n"
+    return "\n".join(lines) + "\n", numbers
 
 
 def wait_for(paths, timeout=20):
@@ -1146,9 +1242,10 @@ def restore_image(ui, img_dir, m, target, log, mounts=None, passphrase=None):
             dst.write(src.read())
             dst.flush()
             os.fsync(dst.fileno())
+    numbers = {}
     if m.get("partition_table"):
         with open(os.path.join(img_dir, m["partition_table"])) as f:
-            script = sfdisk_script(f.read(), target.path)
+            script, numbers = sfdisk_script(f.read(), target.path, m)
         res = run(["sfdisk", "--wipe", "always", "--wipe-partitions", "always", target.path],
                   check=False, input=script)
         log.write(res.stdout + res.stderr)
@@ -1156,8 +1253,8 @@ def restore_image(ui, img_dir, m, target, log, mounts=None, passphrase=None):
             raise Abort(f"Writing the partition table failed:\n{res.stderr.strip()}")
         run(["partprobe", target.path], check=False)
         run(["udevadm", "settle"], check=False)
-    devs = {p["name"]: (part_dev(target.path, p["number"]) if p.get("number") else target.path)
-            for p in parts}
+    devs = {p["name"]: (part_dev(target.path, numbers.get(p["number"], p["number"]))
+                        if p.get("number") else target.path) for p in parts}
     if not wait_for(devs.values()):
         raise Abort("The new partitions did not show up. Reboot and try again.")
 
@@ -1223,6 +1320,101 @@ def restore_image(ui, img_dir, m, target, log, mounts=None, passphrase=None):
                 raise Abort(f"{p['file']} is damaged (checksum mismatch). The restore is incomplete.")
     finally:
         progress.close()
+    fix_boot(ui, m, target, devs, mounts or Mounts(), log)
+
+
+def fix_boot(ui, m, target, devs, mounts, log):
+    """Make the restored disk boot on its own.
+
+    System-only image: remove the other systems' folders from the EFI
+    partition and point the fallback loader (EFI/BOOT/BOOTX64.EFI, what
+    firmware starts on a disk it has no entry for) at this system.
+    Always: add a firmware boot entry when running on UEFI.
+    """
+    esp = next((p for p in m["partitions"] if (p.get("parttype") or "").lower() in ESP_PARTTYPES), None)
+    if not esp:
+        return
+    ui.info("Setting up the boot loader...")
+    dev = devs[esp["name"]]
+    mnt = os.path.join(WORK_DIR, "esp")
+    if not mounts.mount(dev, mnt, "vfat"):
+        note(f"fix_boot: could not mount {dev}")
+        return
+    try:
+        efi = find_ci(mnt, "EFI")
+        if not efi:
+            return
+        systems = m.get("systems") or []
+        if m.get("scope") == "system":
+            removed = []
+            for vendor in os.listdir(efi):
+                name = EFI_VENDORS.get(vendor.lower())
+                if name and not any(same_os(name, sys_name) for sys_name in systems):
+                    removed += [open(os.path.join(dirpath, f), "rb").read()
+                                for dirpath, _, files in os.walk(os.path.join(efi, vendor))
+                                for f in files if f.lower().endswith(".efi")]
+                    shutil.rmtree(os.path.join(efi, vendor))
+                    log.write(f"fix_boot: removed EFI/{vendor}\n")
+            set_fallback_loader(efi, systems, removed, log)
+        add_boot_entries(efi, target, dev, esp.get("partuuid"), log)
+    finally:
+        mounts.umount(mnt)
+
+
+def own_loader(efi, systems):
+    """(vendor folder, loader file name, label) of the first system's loader on the ESP."""
+    for vendor in sorted(os.listdir(efi)):
+        name = EFI_VENDORS.get(vendor.lower())
+        if not name or not any(same_os(name, s) for s in systems):
+            continue
+        for loader in ("bootmgfw.efi", "shimx64.efi", "grubx64.efi"):
+            path = find_ci(efi, vendor, "Boot", loader) if loader == "bootmgfw.efi" \
+                else find_ci(efi, vendor, loader)
+            if path:
+                label = "Windows Boot Manager" if vendor.lower() == "microsoft" else name
+                return path, label
+    return None, None
+
+
+def set_fallback_loader(efi, systems, removed, log):
+    loader, _ = own_loader(efi, systems)
+    if not loader:
+        return
+    boot = find_ci(efi, "BOOT") or os.path.join(efi, "BOOT")
+    os.makedirs(boot, exist_ok=True)
+    fallback = find_ci(boot, "BOOTX64.EFI") or os.path.join(boot, "BOOTX64.EFI")
+    current = open(fallback, "rb").read() if os.path.exists(fallback) else None
+    if current is not None and current not in removed:
+        return  # already this system's (or a generic) loader
+    shutil.copyfile(loader, fallback)
+    # shim started from EFI/BOOT looks for grubx64.efi next to itself
+    grub = os.path.join(os.path.dirname(loader), "grubx64.efi")
+    if os.path.basename(loader).lower() == "shimx64.efi" and os.path.exists(grub):
+        shutil.copyfile(grub, os.path.join(boot, "grubx64.efi"))
+    log.write(f"fix_boot: EFI/BOOT/BOOTX64.EFI <- {os.path.relpath(loader, efi)}\n")
+
+
+def add_boot_entries(efi, target, esp_dev, esp_partuuid, log):
+    if not (os.path.isdir("/sys/firmware/efi") and shutil.which("efibootmgr")):
+        return
+    # Drop entries pointing at this EFI partition (earlier restores), then add fresh ones.
+    if esp_partuuid:
+        listing = run(["efibootmgr", "-v"], check=False).stdout
+        for num in re.findall(rf"^Boot([0-9A-Fa-f]{{4}})\*?.*{re.escape(esp_partuuid)}",
+                              listing, re.M | re.I):
+            run(["efibootmgr", "-b", num, "-B"], check=False)
+            log.write(f"fix_boot: removed old boot entry {num}\n")
+    number = re.search(r"(\d+)$", esp_dev)
+    for vendor in sorted(os.listdir(efi)):
+        name = EFI_VENDORS.get(vendor.lower())
+        if not name or not number:
+            continue
+        loader, label = own_loader(efi, [name])
+        if loader:
+            path = "\\" + os.path.relpath(loader, os.path.dirname(efi)).replace("/", "\\")
+            res = run(["efibootmgr", "-c", "-d", target.path, "-p", number.group(1),
+                       "-L", label, "-l", path], check=False)
+            log.write(f"fix_boot: efibootmgr {label} {path}: rc={res.returncode} {res.stderr}\n")
 
 
 def ask_image_passphrase(ui, img_dir, m):
@@ -1257,8 +1449,9 @@ def do_restore(ui, mounts):
     items = []
     for i, (path, m) in enumerate(images):
         stored = sum(p.get("stored_bytes", 0) for p in m["partitions"])
-        items.append((str(i), f"{m.get('os') or 'Disk image'}   {m.get('created', '')[:16].replace('T', ' ')}"
-                              f"   {human(stored)}   {os.path.relpath(path, loc)}"))
+        scope = " - only this system" if m.get("scope") == "system" else ""
+        items.append((str(i), f"{short_name(m.get('os') or 'Disk image')}{scope}   "
+                              f"{m.get('created', '')[:16].replace('T', ' ')}   {human(stored)}"))
     idx = ui.menu("Which image do you want to restore?", items)
     if idx is None:
         return
@@ -1273,7 +1466,7 @@ def do_restore(ui, mounts):
     targets = [d for d in disks if d.path != image_disk]
     if not targets:
         raise Abort("No disk to restore to (the disk holding the image cannot be used).")
-    items = [(d.path, f"{d.describe()}   now: {d.contents()[:50]}"
+    items = [(d.path, f"{d.describe(True)}   now: {short_name(d.contents())[:60]}"
                       + ("" if d.size >= need else "   TOO SMALL")) for d in targets]
     choice = ui.menu(f"Restore to which disk?\nThe image needs at least {human(need)}.\n"
                      "EVERYTHING on the chosen disk will be erased.", items)
@@ -1390,8 +1583,10 @@ def main():
     if args.list:
         mounts = Mounts()
         try:
-            for label, _, _ in os_choices(scan(ui, mounts)):
-                print(" ", label)
+            for choice in os_choices(scan(ui, mounts)):
+                print(" ", choice[0])
+                if choice[3]:
+                    print("      partitions:", ", ".join(p.name for p in choice[3]))
             if args.debug:
                 print("\nDetails:")
                 for line in LOG:

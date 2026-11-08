@@ -11,6 +11,7 @@ gdisk
 parted
 libhivex-bin
 cryptsetup-bin
+efibootmgr
 # filesystems
 dosfstools
 exfatprogs

@@ -22,6 +22,23 @@ target disk, type its name to confirm. The disk is rebuilt exactly as it was.
 
 Everything is arrow keys + Enter, with a progress bar while it works.
 
+**One system or the whole disk** — on a dual-boot disk the Save menu offers each system on
+its own plus the whole disk:
+
+```
+ Fedora Linux 44 (KDE Plasma Desktop Edition) (encrypted) - only this system   (nvme0n1 953.9 GiB)
+ Microsoft Windows - only this system   (nvme0n1 953.9 GiB)
+ Whole disk: Fedora Linux 44 (KDE Plasma Desktop Edition) + Microsoft Windows   (nvme0n1 953.9 GiB)
+```
+
+"Only this system" saves just what that system needs to boot: for Windows the EFI,
+Microsoft reserved, C: and recovery partitions; for Linux the EFI partition, its `/boot`,
+its root and swap, plus anything its `/etc/fstab` mounts. Restoring it lays those partitions
+out from the start of the target disk (keeping their IDs, so Windows' boot configuration and
+Linux UUID mounts still match), removes the other system's folder from the EFI partition,
+points the fallback boot loader at this system and adds a firmware boot entry. The target
+only needs to be as big as that system's partitions — e.g. Windows alone onto another laptop.
+
 **Dual boot and encryption** — on a disk with several systems each one is listed by name,
 also when it can't be read directly: names come from the EFI system partition
 (`EFI/Microsoft`, `EFI/fedora`, …) and from `/boot` entries. An encrypted (LUKS) Linux
