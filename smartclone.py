@@ -28,7 +28,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 WORK_DIR = "/run/smartclone"
 LIVE_MEDIUM = "/run/live/medium"
 CHUNK = 4 * 1024 * 1024
@@ -391,6 +391,14 @@ def list_disks():
                 fstype=ch.get("fstype"), label=ch.get("label"), uuid=ch.get("uuid"),
                 parttype=ch.get("parttype"), partuuid=ch.get("partuuid"),
                 mountpoints=[m for m in mps if m]))
+        if not disk.partitions and dev.get("fstype") and not disk.pttype:
+            # Filesystem written straight onto the disk, no partition table
+            # (some factory-formatted external drives): treat the disk as its
+            # only partition.
+            disk.partitions.append(Partition(
+                name=dev["name"], path=dev["path"], size=int(dev["size"]),
+                fstype=dev.get("fstype"), label=dev.get("label"), uuid=dev.get("uuid"),
+                mountpoints=[m for m in (dev.get("mountpoints") or [dev.get("mountpoint")]) if m]))
         disks.append(disk)
     return disks
 
@@ -705,23 +713,58 @@ def choose_location(ui, disks, mounts, purpose, exclude=None):
             return path
 
 
+UNUSABLE_FS = {
+    "hfsplus": "Mac format (HFS+), can't write here",
+    "apfs": "Mac format (APFS), can't write here",
+    "BitLocker": "BitLocker, locked",
+    "crypto_LUKS": "encrypted (LUKS)",
+    "LVM2_member": "LVM volume",
+    "linux_raid_member": "RAID member",
+    "iso9660": "read-only (CD/DVD image)",
+    "udf": "read-only (DVD format)",
+    "swap": "swap space",
+}
+
+
+def why_unusable(part):
+    """None if images can be written to this partition, else the reason."""
+    if part.fstype in STORE_FS:
+        return None
+    if not part.fstype:
+        return "no filesystem"
+    return UNUSABLE_FS.get(part.fstype, f"{part.fstype}, not supported")
+
+
 def loc_disk(ui, disks, mounts, target, purpose, exclude):
     while True:
-        items = []
+        items, formattable = [], {}
         for d in disks:
             if exclude and d.path == exclude.path:
                 continue
+            usable = 0
             for p in d.partitions:
-                if (p.fstype not in STORE_FS or p.os_name
-                        or (p.parttype or "").lower() in SYSTEM_PARTTYPES | RECOVERY_PARTTYPES
+                if (p.os_name or p.ptype in SYSTEM_PARTTYPES | RECOVERY_PARTTYPES
                         or any(m == "/" or m.startswith("/boot") for m in p.mounted)):
                     continue
+                lbl = f"'{p.label}'  " if p.label else ""
+                reason = why_unusable(p)
+                if reason:
+                    items.append((f"bad:{p.path}", f"{p.name}  {human(p.size)}  {lbl}"
+                                                   f"({d.describe(True)})  -- {reason}"))
+                    continue
+                usable += 1
                 free = ""
                 if p.mounted:
                     free = f"  free {human(shutil.disk_usage(p.mounted[0]).free)}"
-                lbl = f"'{p.label}'  " if p.label else ""
                 items.append((p.path, f"{p.name}  {human(p.size)}  {p.fstype}  "
                                       f"{lbl}{d.describe()}{free}"))
+            # A disk with nothing usable and no OS on it can be formatted for images.
+            if (purpose == "save" and not usable
+                    and not any(p.os_name or p.mounted for p in d.partitions)):
+                formattable[d.path] = d
+                what = "empty" if not d.partitions else "nothing usable on it"
+                items.append((f"format:{d.path}", f">> Format {d.describe()} for images "
+                                                  f"({what}, erases it)"))
         items.append(("rescan", ">> Rescan (plug the disk in first)"))
         text = ("Pick the disk partition that holds the images."
                 if purpose != "save" else "Pick the disk partition to save the image to.")
@@ -735,6 +778,21 @@ def loc_disk(ui, disks, mounts, target, purpose, exclude):
             time.sleep(3)
             disks[:] = list_disks()
             continue
+        if choice.startswith("bad:"):
+            part = next(p for d in disks for p in d.partitions if p.path == choice[4:])
+            disk = next(d for d in disks if part in d.partitions)
+            hint = (f"\n\nTo use this disk, pick '>> Format {disk.name} ...' (erases it)."
+                    if disk.path in formattable else "")
+            ui.msg(f"{part.name} can't hold images: {why_unusable(part)}.{hint}")
+            continue
+        if choice.startswith("format:"):
+            path = format_disk(ui, formattable[choice[7:]])
+            disks[:] = list_disks()
+            if not path:
+                continue
+            if not mounts.mount(path, target):
+                raise Abort(f"Formatted {path}, but could not mount it.")
+            return target, f"{os.path.basename(path)} 'SMARTCLONE'"
         part = next(p for d in disks for p in d.partitions if p.path == choice)
         name = f"{part.name} '{part.label}'" if part.label else part.name
         if part.mounted:
@@ -745,6 +803,47 @@ def loc_disk(ui, disks, mounts, target, purpose, exclude):
         if not any(mounts.mount(part.path, target, t, o) for t, o in attempts):
             raise Abort(f"Could not mount {part.path} ({part.fstype}).")
         return target, name
+
+
+def format_disk(ui, disk):
+    """Erase a disk and make one partition for images. Returns its path or None."""
+    fs = ui.menu(f"Format {disk.describe()} for images.\nWhich format?", [
+        ("exfat", "exFAT  - works on Windows, Mac and Linux (recommended)"),
+        ("ntfs", "NTFS   - Windows and Linux"),
+        ("ext4", "ext4   - Linux only"),
+    ])
+    if fs is None:
+        return None
+    now = ", ".join(f"{p.name} {human(p.size)} {p.fstype or 'no filesystem'}"
+                    + (f" '{p.label}'" if p.label else "") for p in disk.partitions)
+    if not ui.yesno(f"!!! ALL DATA ON {disk.name} WILL BE ERASED !!!\n\n"
+                    f"Disk:    {disk.describe()}\n"
+                    f"Now on it: {now or 'nothing (empty disk)'}\n\n"
+                    f"Format it as {fs} for SmartClone images?",
+                    yes="Erase and format", no="Cancel"):
+        return None
+    typed = ui.ask(f"To confirm, type the disk name:  {disk.name}", "")
+    if typed is None or typed.strip() != disk.name:
+        ui.msg("Name did not match. Nothing was changed.")
+        return None
+    check_not_busy(disk)
+    ui.info(f"Formatting {disk.name} as {fs}...")
+    for p in disk.partitions:
+        run(["wipefs", "-a", p.path], check=False)
+    run(["wipefs", "-a", disk.path], check=False)
+    ptype = "L" if fs == "ext4" else "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7"
+    run(["sfdisk", "--wipe", "always", disk.path], input=f"label: gpt\n,,{ptype}\n")
+    run(["partprobe", disk.path], check=False)
+    run(["udevadm", "settle"], check=False)
+    part = part_dev(disk.path, 1)
+    if not wait_for([part]):
+        raise Abort(f"The new partition {part} did not show up. Unplug and replug the disk.")
+    mkfs = {"exfat": ["mkfs.exfat", "-L", "SMARTCLONE"],
+            "ntfs": ["mkfs.ntfs", "-Q", "-F", "-L", "SMARTCLONE"],
+            "ext4": ["mkfs.ext4", "-F", "-L", "SMARTCLONE"]}[fs]
+    run(mkfs + [part])
+    run(["udevadm", "settle"], check=False)
+    return part
 
 
 def loc_smb(ui, disks, mounts, target, purpose, exclude):
