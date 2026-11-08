@@ -10,6 +10,7 @@ fdisk
 gdisk
 parted
 libhivex-bin
+cryptsetup-bin
 # filesystems
 dosfstools
 exfatprogs

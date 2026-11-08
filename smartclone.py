@@ -28,15 +28,17 @@ import sys
 import time
 from dataclasses import dataclass, field
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 WORK_DIR = "/run/smartclone"
 LIVE_MEDIUM = "/run/live/medium"
 CHUNK = 4 * 1024 * 1024
 BOOT_AREA_MAX = 64 * 1024 * 1024
 IMAGE_SEARCH_DEPTH = 3
 MIN_DISK = 64 * 1024 * 1024  # hides floppies, card-reader stubs and the like
-# EFI system / Microsoft reserved partitions: never a place to keep images.
+# EFI system, Linux /boot (XBOOTLDR) and Microsoft reserved partitions:
+# never a place to keep images, never an OS root.
 SYSTEM_PARTTYPES = {"c12a7328-f81f-11d2-ba4b-00a0c93ec93b", "0xef",
+                    "bc13c2ff-59e6-4262-a352-b275fd6f7172",
                     "e3c9e316-0b5c-4db8-817d-f92df00215ae"}
 RECOVERY_PARTTYPES = {"de94bba4-06d1-4d40-a16a-bfd50179d6ac", "0x27"}
 # Folder name under EFI/ on the EFI system partition -> OS it boots.
@@ -384,10 +386,29 @@ def list_disks():
 
 
 class Mounts:
-    """Tracks mounts we make so they are always undone."""
+    """Tracks mounts and unlocked LUKS devices we make so they are always undone."""
 
     def __init__(self):
         self.stack = []
+        self.mappers = []
+
+    def unlock(self, dev, name, passphrase, readonly=True):
+        """cryptsetup open; returns the /dev/mapper path or None (wrong passphrase)."""
+        cmd = ["cryptsetup", "open", "--type", "luks", "--key-file", "-"]
+        if readonly:
+            cmd.append("--readonly")
+        res = run(cmd + [dev, name], check=False, input=passphrase)
+        if res.returncode != 0:
+            note(f"cryptsetup open {dev}: {res.stderr.strip()}")
+            return None
+        self.mappers.append(name)
+        run(["udevadm", "settle"], check=False)
+        return f"/dev/mapper/{name}"
+
+    def lock(self, name):
+        run(["cryptsetup", "close", name], check=False)
+        if name in self.mappers:
+            self.mappers.remove(name)
 
     def mount(self, dev, target, fstype=None, options=None):
         os.makedirs(target, exist_ok=True)
@@ -415,6 +436,8 @@ class Mounts:
     def umount_all(self):
         for target in reversed(list(self.stack)):
             self.umount(target)
+        for name in reversed(list(self.mappers)):
+            self.lock(name)
 
 
 def mount_ro(mounts, path, fs, target):
@@ -565,8 +588,15 @@ def assign_boot_names(disk):
 
 def scan(ui, mounts):
     ui.info("Scanning disks...")
+    LOG.clear()
     disks = list_disks()
     probe(disks, mounts)
+    try:
+        os.makedirs(WORK_DIR, exist_ok=True)
+        with open(os.path.join(WORK_DIR, "probe.log"), "w") as f:
+            f.write("\n".join(LOG) + "\n")
+    except OSError:
+        pass
     return disks
 
 
@@ -626,7 +656,7 @@ def loc_disk(ui, disks, mounts, target, purpose, exclude):
                 continue
             for p in d.partitions:
                 if (p.fstype not in STORE_FS or p.os_name
-                        or (p.parttype or "").lower() in SYSTEM_PARTTYPES
+                        or (p.parttype or "").lower() in SYSTEM_PARTTYPES | RECOVERY_PARTTYPES
                         or any(m == "/" or m.startswith("/boot") for m in p.mounted)):
                     continue
                 free = ""
@@ -762,6 +792,12 @@ def plan_partition(part):
     """Returns (method, producer command or None, expected bytes)."""
     if part.fstype == "swap":
         return "swap", None, 0
+    if part.inner_path:  # unlocked LUKS: save the filesystem inside + the LUKS header
+        tool = partclone_tool(part.inner_fstype)
+        if tool:
+            return ("luks-partclone", [tool, "-c", "-s", part.inner_path, "-o", "-"],
+                    part.used or part.size)
+        return "luks-raw", None, part.size
     tool = partclone_tool(part.fstype)
     if tool:
         return "partclone", [tool, "-c", "-s", part.path, "-o", "-"], part.used or part.size
@@ -845,7 +881,14 @@ def save_image(ui, disk, os_name, img_dir, shown, log):
             manifest["partitions"].append(entry)
             if method == "swap":
                 continue  # recreated with mkswap on restore
-            progress.step(f"Partition {i}/{len(plans)}: {part.name} ({part.fstype or 'raw'})")
+            fs = part.fstype or "raw"
+            if part.inner_path:
+                fs = f"encrypted {part.inner_fstype or 'data'}"
+                entry["inner_fstype"] = part.inner_fstype
+                entry["luks_header"] = f"{part.name}.luks-header"
+                run(["cryptsetup", "luksHeaderBackup", part.path, "--header-backup-file",
+                     os.path.join(img_dir, entry["luks_header"])])
+            progress.step(f"Partition {i}/{len(plans)}: {part.name} ({fs})")
             entry["file"] = f"{part.name}.{method}.{ext}"
             out_path = os.path.join(img_dir, entry["file"])
             with open(out_path, "wb") as out:
@@ -858,7 +901,7 @@ def save_image(ui, disk, os_name, img_dir, shown, log):
                         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=log)
                         entry["bytes"], entry["sha256"] = pump(proc.stdout, comp.stdin, progress)
                     else:
-                        with open(part.path, "rb", buffering=0) as src:
+                        with open(part.inner_path or part.path, "rb", buffering=0) as src:
                             entry["bytes"], entry["sha256"] = pump(src, comp.stdin, progress)
                 finally:
                     comp.stdin.close()
@@ -868,7 +911,12 @@ def save_image(ui, disk, os_name, img_dir, shown, log):
                         proc.stdout.close()
                         rc = proc.wait()
             if rc != 0:
-                raise Abort(f"{cmd[0]} failed on {part.path}.\nDetails in {img_dir}/smartclone.log")
+                hint = ""
+                if part.fstype == "ntfs":
+                    hint = ("\n\nIf Windows was not fully shut down (Fast Startup or hibernation):"
+                            " start Windows, turn off Fast Startup (Control Panel > Power"
+                            " Options > Choose what the power buttons do), shut down and try again.")
+                raise Abort(f"{cmd[0]} failed on {part.path}.\nDetails in {shown}/smartclone.log{hint}")
             if comp_rc != 0:
                 raise Abort(f"Writing {out_path} failed (destination full or disconnected?).")
             entry["stored_bytes"] = os.path.getsize(out_path)
@@ -913,6 +961,15 @@ def restore_cmd(p, d):
     num = p.get("number")
     dev = f"${{TARGET}}${{P}}{num}" if num else "$TARGET"
     f = p.get("file")
+    if p["method"].startswith("luks-"):
+        if p["method"] == "luks-partclone":
+            tool = partclone_tool(p["inner_fstype"]) or f"partclone.{p['inner_fstype']}"
+            write = f"{d} {f} | {tool} -r -s - -o /dev/mapper/restored"
+        else:
+            write = f"{d} {f} | dd of=/dev/mapper/restored bs=4M conv=fsync"
+        return "\n".join([f"dd if={p['luks_header']} of={dev} bs=1M conv=fsync",
+                          f"cryptsetup open {dev} restored     # same passphrase as before",
+                          write, "cryptsetup close restored"])
     if p["method"] == "partclone":
         tool = partclone_tool(p["fstype"]) or f"partclone.{p['fstype']}"
         return f"{d} {f} | {tool} -r -s - -o {dev}"
@@ -923,6 +980,39 @@ def restore_cmd(p, d):
     opts = (f" -U {p['uuid']}" if p.get("uuid") else "") + \
            (f" -L {p['label']}" if p.get("label") else "")
     return f"mkswap{opts} {dev}"
+
+
+def unlock_encrypted(ui, mounts, disk):
+    """Ask for each LUKS partition's passphrase so only the used space is saved."""
+    for part in disk.partitions:
+        if part.fstype != "crypto_LUKS":
+            continue
+        mapper = None
+        while mapper is None:
+            what = f"\n{part.os_name}" if part.os_name else ""
+            pw = ui.ask(f"{part.name} ({human(part.size)}) is encrypted.{what}\n\n"
+                        "Enter its passphrase to save only the used space.\n"
+                        "Cancel = copy the whole partition as it is (slow, the image is as "
+                        "big as the partition).", password=True)
+            if not pw:
+                break
+            ui.info("Unlocking...")
+            mapper = mounts.unlock(part.path, f"smartclone-{part.name}", pw)
+            if mapper is None:
+                ui.msg("Wrong passphrase, try again.")
+        if mapper is None:
+            continue
+        fs = run(["blkid", "-o", "value", "-s", "TYPE", mapper], check=False).stdout.strip()
+        part.inner_path, part.inner_fstype = mapper, fs or None
+        target = os.path.join(WORK_DIR, "probe", f"{part.name}-inner")
+        if fs and mount_ro(mounts, mapper, fs, target):
+            try:
+                name = detect_os(target)
+                part.used = usage(target)
+            finally:
+                mounts.umount(target)
+            if name:
+                part.os_name = f"{name}  (encrypted)"
 
 
 def do_save(ui, mounts):
@@ -937,6 +1027,10 @@ def do_save(ui, mounts):
         return
     _, source, os_name = choices[int(idx)]
     check_not_busy(source)
+    unlock_encrypted(ui, mounts, source)
+    if os_name and "(encrypted)" in os_name:  # name may be more precise now
+        os_name = next((p.os_name for p in source.partitions
+                        if p.inner_path and p.os_name), os_name)
 
     loc = choose_location(ui, disks, mounts, "save", exclude=source)
     if loc is None:
@@ -945,7 +1039,8 @@ def do_save(ui, mounts):
     if disk_of_path(dest) == source.path:
         raise Abort(f"{dest} is on the disk being saved ({source.path}). Pick another place.")
 
-    default = slug(f"{os_name or source.name}-{datetime.datetime.now():%Y-%m-%d-%H%M}")
+    base = re.sub(r"\s*\((encrypted|not readable|BitLocker)\)", "", os_name or source.name)
+    default = f"{slug(base)[:40]}-{datetime.datetime.now():%Y-%m-%d-%H%M}"
     while True:
         name = ui.ask("Name of the image (a folder with this name is created)", default)
         if not name:
@@ -958,7 +1053,9 @@ def do_save(ui, mounts):
 
     estimate = sum(plan_partition(p)[2] for p in source.partitions) or source.size
     free = shutil.disk_usage(dest).free
+    others = [p.os_name for p in source.partitions if p.os_name and p.os_name != os_name]
     summary = (f"Save:        {os_name or '(no OS found)'}\n"
+               + (f"Also on it:  {', '.join(others)}\n" if others else "") +
                f"Disk:        {source.describe()}\n"
                f"Partitions:  {', '.join(p.name for p in source.partitions) or 'none'}\n"
                f"Save to:     {shown}\n"
@@ -1037,7 +1134,7 @@ def wait_for(paths, timeout=20):
     return False
 
 
-def restore_image(ui, img_dir, m, target, log):
+def restore_image(ui, img_dir, m, target, log, mounts=None, passphrase=None):
     decomp = decompressor(m["compression"])
     parts = m["partitions"]
 
@@ -1074,14 +1171,28 @@ def restore_image(ui, img_dir, m, target, log):
                       (["-L", p["label"]] if p.get("label") else []) + [dev]
                 run(cmd, check=False, stdout=log, stderr=log)
                 continue
-            progress.step(f"Partition {i}/{len(parts)}: {os.path.basename(dev)} "
-                          f"({p.get('fstype') or 'raw'})")
-            if p["method"] == "partclone":
-                tool = partclone_tool(p["fstype"])
+            method, fstype, mapper = p["method"], p.get("fstype"), None
+            if method.startswith("luks-"):
+                # Same LUKS header as the original, so the same passphrase unlocks it;
+                # then the filesystem goes inside.
+                with open(os.path.join(img_dir, p["luks_header"]), "rb") as src, \
+                        open(dev, "r+b") as dst:
+                    dst.write(src.read())
+                    dst.flush()
+                    os.fsync(dst.fileno())
+                mapper = f"smartclone-restore-{i}"
+                dev = mounts.unlock(dev, mapper, passphrase, readonly=False)
+                if dev is None:
+                    raise Abort(f"Could not unlock the restored encrypted partition {devs[p['name']]}.")
+                method, fstype = method[len("luks-"):], p.get("inner_fstype")
+            progress.step(f"Partition {i}/{len(parts)}: {os.path.basename(devs[p['name']])} "
+                          f"({'encrypted ' if mapper else ''}{fstype or 'raw'})")
+            if method == "partclone":
+                tool = partclone_tool(fstype)
                 if not tool:
-                    raise Abort(f"partclone for {p['fstype']} is not installed.")
+                    raise Abort(f"partclone for {fstype} is not installed.")
                 cmd = [tool, "-r", "-s", "-", "-o", dev]
-            elif p["method"] == "ntfsclone":
+            elif method == "ntfsclone":
                 cmd = ["ntfsclone", "--restore-image", "--overwrite", dev, "-"]
             else:
                 cmd = None
@@ -1104,12 +1215,32 @@ def restore_image(ui, img_dir, m, target, log):
                 if consumer:
                     consumer.stdin.close()
                     rc = consumer.wait()
+                if mapper:
+                    mounts.lock(mapper)
             if dec_rc != 0 or rc != 0:
                 raise Abort(f"Restoring {p['file']} to {dev} failed.\nDetails in {log.name}")
             if p.get("sha256") and sha != p["sha256"]:
                 raise Abort(f"{p['file']} is damaged (checksum mismatch). The restore is incomplete.")
     finally:
         progress.close()
+
+
+def ask_image_passphrase(ui, img_dir, m):
+    """Passphrase of the encrypted partition in the image, checked against its
+    saved LUKS header. None if nothing is encrypted, False if cancelled."""
+    headers = [p["luks_header"] for p in m["partitions"] if p.get("luks_header")]
+    if not headers:
+        return None
+    while True:
+        pw = ui.ask("This image contains an encrypted partition.\n"
+                    "Enter the passphrase it had when it was saved:", password=True)
+        if not pw:
+            return False
+        res = run(["cryptsetup", "open", "--test-passphrase", "--key-file", "-",
+                   os.path.join(img_dir, headers[0])], check=False, input=pw)
+        if res.returncode == 0:
+            return pw
+        ui.msg("Wrong passphrase, try again.")
 
 
 def do_restore(ui, mounts):
@@ -1142,7 +1273,7 @@ def do_restore(ui, mounts):
     targets = [d for d in disks if d.path != image_disk]
     if not targets:
         raise Abort("No disk to restore to (the disk holding the image cannot be used).")
-    items = [(d.path, f"{d.describe()}   now: {d.contents()}"
+    items = [(d.path, f"{d.describe()}   now: {d.contents()[:50]}"
                       + ("" if d.size >= need else "   TOO SMALL")) for d in targets]
     choice = ui.menu(f"Restore to which disk?\nThe image needs at least {human(need)}.\n"
                      "EVERYTHING on the chosen disk will be erased.", items)
@@ -1152,6 +1283,9 @@ def do_restore(ui, mounts):
     if target.size < need:
         raise Abort(f"{target.name} is {human(target.size)}, the image needs {human(need)}.")
     check_not_busy(target)
+    passphrase = ask_image_passphrase(ui, img_dir, m)
+    if passphrase is False:
+        return
 
     if not ui.yesno(f"Restore:  {m.get('os') or 'disk image'}  ({m.get('created', '')[:16]})\n"
                     f"From:     {where}/{os.path.relpath(img_dir, loc)}\n"
@@ -1169,7 +1303,7 @@ def do_restore(ui, mounts):
     os.makedirs(WORK_DIR, exist_ok=True)
     log_path = os.path.join(WORK_DIR, "restore.log")
     with open(log_path, "w") as log:
-        restore_image(ui, img_dir, m, target, log)
+        restore_image(ui, img_dir, m, target, log, mounts, passphrase)
     ui.info("Flushing data to the disk...")
     run(["sync"], check=False)
     ui.msg(f"Restore finished in {duration(time.monotonic() - start)}.\n\n"
@@ -1242,6 +1376,7 @@ def main():
     ap.add_argument("--restore", action="store_true", help="go straight to restoring an image")
     ap.add_argument("--list", action="store_true", help="only list detected operating systems")
     ap.add_argument("--plain", action="store_true", help="plain text prompts instead of dialogs")
+    ap.add_argument("--debug", action="store_true", help="with --list: show why things were not detected")
     args = ap.parse_args()
 
     if os.geteuid() != 0:
@@ -1257,6 +1392,10 @@ def main():
         try:
             for label, _, _ in os_choices(scan(ui, mounts)):
                 print(" ", label)
+            if args.debug:
+                print("\nDetails:")
+                for line in LOG:
+                    print(" ", line)
         finally:
             mounts.umount_all()
     elif args.save:

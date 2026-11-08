@@ -22,6 +22,17 @@ target disk, type its name to confirm. The disk is rebuilt exactly as it was.
 
 Everything is arrow keys + Enter, with a progress bar while it works.
 
+**Dual boot and encryption** — on a disk with several systems each one is listed by name,
+also when it can't be read directly: names come from the EFI system partition
+(`EFI/Microsoft`, `EFI/fedora`, …) and from `/boot` entries. An encrypted (LUKS) Linux
+asks for its passphrase: with it only the used space is saved (the LUKS header is kept, so
+the restored disk opens with the same passphrase); without it the partition is copied as is.
+Hibernated Windows (Fast Startup) is saved read-only; for a consistent copy shut Windows
+down fully first (disable Fast Startup).
+
+If a system is not listed, open the command line and run `smartclone --list --debug` (or see
+`/run/smartclone/probe.log`): it says why each partition was not recognised.
+
 ## 1. Build the USB image
 
 Needs Docker and internet access (about 2–5 minutes, ~1 GB download the first time):
