@@ -1,0 +1,9 @@
+#!/bin/sh
+# Boot straight into SmartClone after 5 seconds, with friendlier menu names.
+set -e
+sed -i 's/^set default=0$/set default=0\nset timeout=5/' boot/grub/config.cfg
+sed -i -e 's/"Live system (amd64)"/"SmartClone"/' \
+       -e 's/"Live system (amd64 fail-safe mode)"/"SmartClone (safe graphics mode)"/' boot/grub/grub.cfg
+sed -i 's/^timeout 0$/timeout 50/' isolinux/isolinux.cfg
+sed -i -e 's/\^Live system (amd64)$/^SmartClone/' \
+       -e 's/Live system (amd64 fail-safe mode)/SmartClone (safe graphics mode)/' isolinux/live.cfg

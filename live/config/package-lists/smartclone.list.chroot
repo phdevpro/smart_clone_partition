@@ -1,0 +1,39 @@
+# SmartClone itself
+python3
+whiptail
+# imaging
+partclone
+ntfs-3g
+zstd
+pigz
+fdisk
+gdisk
+parted
+libhivex-bin
+# filesystems
+dosfstools
+exfatprogs
+e2fsprogs
+xfsprogs
+btrfs-progs
+f2fs-tools
+# network destinations
+cifs-utils
+nfs-common
+network-manager
+wpasupplicant
+# keyboard layouts for loadkeys
+console-data
+kbd
+# firmware for common NICs / wifi
+firmware-linux-free
+firmware-misc-nonfree
+firmware-realtek
+firmware-iwlwifi
+firmware-atheros
+firmware-bnx2
+# handy in the shell
+nano
+less
+pciutils
+usbutils
